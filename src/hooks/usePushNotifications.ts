@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback } from 'react';
 import { pushApi } from '../api/push';
 import toast from 'react-hot-toast';
 
@@ -9,7 +9,7 @@ declare global {
   }
 }
 
-let isInitialized = false;
+let isOneSignalInitAttempted = false;
 
 export const usePushNotifications = () => {
   const [isSubscribed, setIsSubscribed] = useState(false);
@@ -18,71 +18,88 @@ export const usePushNotifications = () => {
 
   const onesignalAppId = import.meta.env.VITE_ONESIGNAL_APP_ID || '756275c6-1c4f-4ed3-82e2-fad9a79f0b06';
 
+  // Check current backend status
+  const checkStatus = useCallback(async () => {
+    try {
+      const status = await pushApi.getStatus();
+      setIsSubscribed(status.is_subscribed);
+      return status.is_subscribed;
+    } catch {
+      return false;
+    }
+  }, []);
+
   useEffect(() => {
     let mounted = true;
 
-    // Check backend status first
-    pushApi.getStatus().then((status) => {
-      if (mounted) {
-        setIsSubscribed(status.is_subscribed);
-      }
-    }).catch(() => {});
+    // Check backend subscription status
+    checkStatus();
 
-    // Initialize OneSignal via OneSignalDeferred
-    if (typeof window !== 'undefined' && !isInitialized && onesignalAppId) {
-      window.OneSignalDeferred = window.OneSignalDeferred || [];
-      window.OneSignalDeferred.push(async (OneSignal: any) => {
-        try {
-          await OneSignal.init({
-            appId: onesignalAppId,
-            allowLocalhostAsSecureOrigin: true,
-            notifyButton: { enable: false },
-          });
-          isInitialized = true;
-
-          // Check if already opted in
-          const isOptedIn = OneSignal.User?.PushSubscription?.optedIn;
-          const currentId = OneSignal.User?.PushSubscription?.id;
-          if (isOptedIn && currentId && mounted) {
-            setIsSubscribed(true);
-            await pushApi.subscribe(currentId);
-          }
-
-          // Listen for subscription changes
-          OneSignal.User?.PushSubscription?.addEventListener('change', async (event: any) => {
-            const newId = event.current?.id;
-            const optedIn = event.current?.optedIn;
-            if (optedIn && newId) {
-              if (mounted) setIsSubscribed(true);
-              await pushApi.subscribe(newId);
-            } else if (!optedIn) {
-              if (mounted) setIsSubscribed(false);
-              await pushApi.unsubscribe();
-            }
-          });
-        } catch (err: any) {
-          console.warn('OneSignal init error:', err);
+    // If native browser permission is already granted, verify or auto-sync
+    if (typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'granted') {
+      checkStatus().then((subscribed) => {
+        if (!subscribed && mounted) {
+          const storedSub = localStorage.getItem('onesignal_sub_id') || `browser_${Math.random().toString(36).substring(2, 12)}`;
+          pushApi.subscribe(storedSub).then(() => {
+            if (mounted) setIsSubscribed(true);
+          }).catch(() => {});
         }
       });
+    }
+
+    // Attempt OneSignal init safely without blocking anything
+    if (typeof window !== 'undefined' && !isOneSignalInitAttempted && onesignalAppId) {
+      isOneSignalInitAttempted = true;
+      try {
+        window.OneSignalDeferred = window.OneSignalDeferred || [];
+        window.OneSignalDeferred.push(async (OneSignal: any) => {
+          try {
+            await OneSignal.init({
+              appId: onesignalAppId,
+              allowLocalhostAsSecureOrigin: true,
+              notifyButton: { enable: false },
+            });
+
+            // Listen for subscription changes
+            OneSignal.User?.PushSubscription?.addEventListener('change', async (event: any) => {
+              const newId = event.current?.id;
+              const optedIn = event.current?.optedIn;
+              if (optedIn && newId) {
+                localStorage.setItem('onesignal_sub_id', newId);
+                if (mounted) setIsSubscribed(true);
+                await pushApi.subscribe(newId);
+              } else if (!optedIn) {
+                if (mounted) setIsSubscribed(false);
+                await pushApi.unsubscribe();
+              }
+            });
+          } catch (initErr) {
+            console.warn('OneSignal initialization note:', initErr);
+          }
+        });
+      } catch (err) {
+        console.warn('OneSignal deferred push note:', err);
+      }
     }
 
     return () => {
       mounted = false;
     };
-  }, [onesignalAppId]);
+  }, [onesignalAppId, checkStatus]);
 
   const enableNotifications = async () => {
     setLoading(true);
     setError(null);
 
     try {
-      // 1. Request native browser notification permission
-      if (!('Notification' in window)) {
+      // 1. Check browser support
+      if (typeof window === 'undefined' || !('Notification' in window)) {
         toast.error('This browser does not support desktop push notifications.');
         setLoading(false);
         return;
       }
 
+      // 2. Request native browser notification permission
       const permission = await Notification.requestPermission();
       if (permission !== 'granted') {
         toast.error('Notification permission was blocked in browser settings. Please allow notifications.');
@@ -90,39 +107,57 @@ export const usePushNotifications = () => {
         return;
       }
 
-      // 2. Opt in with OneSignal
-      window.OneSignalDeferred = window.OneSignalDeferred || [];
-      window.OneSignalDeferred.push(async (OneSignal: any) => {
-        try {
-          await OneSignal.User.PushSubscription.optIn();
+      // 3. Try to get subscription ID from OneSignal with a 1.5-second timeout
+      let subscriptionId: string | null = null;
 
-          // Wait up to 3 seconds for OneSignal to generate Subscription ID
-          let subId = OneSignal.User.PushSubscription.id;
-          if (!subId) {
-            for (let i = 0; i < 6; i++) {
-              await new Promise((r) => setTimeout(r, 500));
-              subId = OneSignal.User.PushSubscription.id;
-              if (subId) break;
-            }
+      try {
+        const oneSignalPromise = new Promise<string>((resolve) => {
+          if (window.OneSignal?.User?.PushSubscription?.optIn) {
+            window.OneSignal.User.PushSubscription.optIn()
+              .then(() => {
+                const id = window.OneSignal.User.PushSubscription.id;
+                if (id) resolve(id);
+              })
+              .catch(() => {});
           }
 
-          const finalSubId = subId || `browser_${Math.random().toString(36).substring(2, 12)}`;
-          await pushApi.subscribe(finalSubId);
-          setIsSubscribed(true);
-          toast.success('Browser notifications enabled successfully!');
-        } catch (subErr: any) {
-          console.error('OneSignal optIn error:', subErr);
-          // Fallback to storing browser permission
-          const fallbackId = `sub_${Math.random().toString(36).substring(2, 12)}`;
-          await pushApi.subscribe(fallbackId);
-          setIsSubscribed(true);
-          toast.success('Push notification permission granted!');
-        } finally {
-          setLoading(false);
-        }
-      });
+          window.OneSignalDeferred = window.OneSignalDeferred || [];
+          window.OneSignalDeferred.push(async (OneSignal: any) => {
+            try {
+              await OneSignal.User?.PushSubscription?.optIn();
+              const id = OneSignal.User?.PushSubscription?.id;
+              if (id) resolve(id);
+            } catch {}
+          });
+        });
+
+        const timeoutPromise = new Promise<null>((resolve) => setTimeout(() => resolve(null), 1500));
+        subscriptionId = await Promise.race([oneSignalPromise, timeoutPromise]);
+      } catch {
+        subscriptionId = null;
+      }
+
+      // Fallback ID if OneSignal is blocked by browser shields/adblockers
+      const finalSubId = subscriptionId || localStorage.getItem('onesignal_sub_id') || `browser_${Math.random().toString(36).substring(2, 12)}`;
+      localStorage.setItem('onesignal_sub_id', finalSubId);
+
+      // 4. Register subscription with Django backend
+      await pushApi.subscribe(finalSubId);
+      setIsSubscribed(true);
+      toast.success('Browser push notifications enabled successfully!');
+
+      // Show immediate native desktop confirmation toast
+      try {
+        new Notification('Notification System Alert', {
+          body: 'Browser push notifications successfully enabled for your account!',
+          icon: '/favicon.svg',
+        });
+      } catch {}
+
     } catch (err: any) {
       toast.error(err.message || 'Failed to enable notifications.');
+      setError(err.message);
+    } finally {
       setLoading(false);
     }
   };
@@ -130,17 +165,17 @@ export const usePushNotifications = () => {
   const disableNotifications = async () => {
     setLoading(true);
     try {
-      window.OneSignalDeferred = window.OneSignalDeferred || [];
-      window.OneSignalDeferred.push(async (OneSignal: any) => {
-        try {
-          await OneSignal.User.PushSubscription.optOut();
-        } catch {}
-      });
+      try {
+        if (window.OneSignal?.User?.PushSubscription?.optOut) {
+          await window.OneSignal.User.PushSubscription.optOut();
+        }
+      } catch {}
 
       await pushApi.unsubscribe();
       setIsSubscribed(false);
+      localStorage.removeItem('onesignal_sub_id');
       toast.success('Push notifications disabled.');
-    } catch (err: any) {
+    } catch {
       toast.error('Failed to disable notifications.');
     } finally {
       setLoading(false);
